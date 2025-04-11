@@ -2,15 +2,14 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
+from prophet import Prophet
+import matplotlib.pyplot as plt
 
 # Validation Framework
 def validate_columns_and_values(data):
     validation_results = {}
-
-    # Standardize column names
     data.columns = [col.strip().lower().replace(" ", "_") for col in data.columns]
 
-    # Iterate through columns and validate
     for column in data.columns:
         validation_results[column] = {
             "missing_count": 0,
@@ -23,130 +22,62 @@ def validate_columns_and_values(data):
 
         # Handle numeric columns
         if data[column].dtype in ['float64', 'int64']:
-            # Missing values
             missing = data[data[column].isnull()]
             validation_results[column]["missing_count"] = missing.shape[0]
             validation_results[column]["missing_values"] = list(missing[column].unique())
-
-            # Negative values (invalid)
             invalid = data[data[column] < 0]
             validation_results[column]["invalid_count"] = invalid.shape[0]
             validation_results[column]["invalid_values"] = list(invalid[column].unique())
             data[column] = data[column].apply(lambda x: max(x, 0))
-
-            # Outliers (using Z-score)
             z_scores = (data[column] - data[column].mean()) / data[column].std()
             outliers = data[np.abs(z_scores) > 3]
             validation_results[column]["outlier_count"] = outliers.shape[0]
             validation_results[column]["outlier_values"] = list(outliers[column].unique())
-
-        # Handle categorical columns
         elif data[column].dtype == 'object':
-            # Missing/empty values
             missing = data[data[column].isnull() | (data[column] == "")]
             validation_results[column]["missing_count"] = missing.shape[0]
             validation_results[column]["missing_values"] = list(missing[column].unique())
-
-            # Invalid entries
             invalid = data[data[column].str.contains(r"NULL|Not Available|Missing", na=False)]
             validation_results[column]["invalid_count"] = invalid.shape[0]
             validation_results[column]["invalid_values"] = list(invalid[column].unique())
-
-        # Handle date columns
         elif pd.api.types.is_datetime64_any_dtype(data[column]):
-            # Missing values
             missing = data[data[column].isnull()]
             validation_results[column]["missing_count"] = missing.shape[0]
             validation_results[column]["missing_values"] = list(missing[column].unique())
-
-            # Future dates
             invalid = data[data[column] > pd.Timestamp.now()]
             validation_results[column]["invalid_count"] = invalid.shape[0]
             validation_results[column]["invalid_values"] = list(invalid[column].unique())
 
     return validation_results
 
-def display_validation_summary(validation_summary):
-    summary_data = []
-    for column, details in validation_summary.items():
-        summary_data.append([
-            column.upper(),
-            details['missing_count'], 
-            ", ".join(map(str, details['missing_values'])) if details['missing_values'] else "None",
-            details['invalid_count'], 
-            ", ".join(map(str, details['invalid_values'])) if details['invalid_values'] else "None",
-            details['outlier_count'], 
-            ", ".join(map(str, details['outlier_values'])) if details['outlier_values'] else "None"
-        ])
-
-    summary_df = pd.DataFrame(summary_data, columns=[
-        "Column Name", "Missing Count", "Missing Values",
-        "Invalid Count", "Invalid Values", "Outlier Count", "Outlier Values"
-    ])
-    st.write("### Validation Summary:")
-    st.dataframe(summary_df, height=300)
-
 # Data Cleaning Framework
-def is_alphanumeric_id(series):
-    if series.dtype == 'object':
-        non_null = series.dropna()
-        if len(non_null) == 0:
-            return False
-        match_count = non_null.astype(str).str.match(r'^[A-Za-z0-9\-_]+$', na=False).sum()
-        return (match_count / len(non_null)) >= 0.6
-    return False
-
 def clean_data(data):
-    # Preserve original copy
-    original_data = data.copy()
-    
-    # Standardize column names
     data.columns = [col.strip().lower().replace(" ", "_") for col in data.columns]
-    
-    # Identify ID columns
-    id_columns = [col for col in data.columns if is_alphanumeric_id(data[col].astype(str))]
-    
     for column in data.columns:
-        if column in id_columns:
-            # Handle ID columns
-            data[column] = data[column].astype(str).fillna("Unknown_ID")
-        else:
-            # Smart date detection
-            if data[column].dtype == 'object' and any(kw in column for kw in ['date', 'time']):
+        if data[column].dtype == 'object':
+            data[column] = data[column].replace(["Not Available", "NULL", "Missing", "Unknown", " "], np.nan)
+            if any(kw in column for kw in ['date', 'time']):
                 try:
                     temp_series = pd.to_datetime(data[column], errors='coerce')
                     if temp_series.notna().mean() > 0.5:
                         data[column] = temp_series
                 except:
                     pass
-
-    # Handle missing values
     for column in data.columns:
-        if column in id_columns:
-            continue
-            
         if data[column].isnull().sum() > 0:
             if data[column].dtype in ['float64', 'int64']:
+                data[column] = pd.to_numeric(data[column], errors='coerce')
                 data[column].fillna(data[column].median(), inplace=True)
             elif pd.api.types.is_datetime64_any_dtype(data[column]):
                 data[column].fillna(data[column].mode()[0], inplace=True)
             elif data[column].dtype == 'object':
                 data[column].fillna("Unknown", inplace=True)
-
-    # Remove duplicates
     data = data.drop_duplicates()
-    
     return data
 
-# Enhanced Feature Engineering Framework
+# Feature Engineering Framework
 def feature_engineering(data):
-    # Preserve original index for time-series
-    original_index = data.index
-    
-    # Standardize column names
     data.columns = [col.strip().lower().replace(" ", "_") for col in data.columns]
-
-    # Date feature engineering
     date_columns = [col for col in data.columns if pd.api.types.is_datetime64_any_dtype(data[col])]
     for date_col in date_columns:
         try:
@@ -154,99 +85,162 @@ def feature_engineering(data):
             data[f"{date_col}_month"] = data[date_col].dt.month
             data[f"{date_col}_day"] = data[date_col].dt.day
             data[f"{date_col}_dayofweek"] = data[date_col].dt.dayofweek
-            data[f"{date_col}_is_weekend"] = data[date_col].dt.dayofweek >= 5
         except Exception as e:
             st.warning(f"Date processing warning: {e}")
-
-    # Categorical encoding (1/0)
-    categorical_columns = data.select_dtypes(include=['object']).columns.tolist()
-    for cat_col in categorical_columns:
-        if 1 < data[cat_col].nunique() <= 20:
-            # Create integer-encoded dummy variables
-            dummies = pd.get_dummies(data[cat_col], prefix=cat_col, dtype=int)
-            data = pd.concat([data.drop(columns=[cat_col]), dummies], axis=1)
-
-    # Time-series specific features
-    numeric_columns = data.select_dtypes(include=['int64', 'float64']).columns.tolist()
-    for num_col in numeric_columns:
-        # Lag features
-        if 'target' in num_col.lower():
-            for lag in [1, 7, 30]:  # Daily, weekly, monthly lags
-                data[f'{num_col}_lag_{lag}'] = data[num_col].shift(lag)
-        
-        # Rolling features
-        if 'value' in num_col.lower():
-            data[f'{num_col}_rolling_7d_mean'] = data[num_col].rolling(7).mean()
-            data[f'{num_col}_rolling_30d_std'] = data[num_col].rolling(30).std()
-
-    # Scale numeric features
-    numeric_columns = data.select_dtypes(include=['int64', 'float64']).columns.tolist()
-    if numeric_columns:
-        scaler = MinMaxScaler()
-        data[numeric_columns] = scaler.fit_transform(data[numeric_columns])
-
-    # Cleanup
-    data = data.dropna()
-    data = data.loc[:, ~data.columns.duplicated()]
-    
     return data
 
+# Sales Prediction Framework
+# Function for Prophet Sales Prediction
+def prepare_dataset(data, date_column, value_column):
+    prophet_data = data.rename(columns={date_column: "ds", value_column: "y"})
+    prophet_data["ds"] = pd.to_datetime(prophet_data["ds"], errors='coerce')
+    prophet_data = prophet_data.dropna(subset=["ds", "y"])
+    return prophet_data
+
+def train_prophet_model(data):
+    model = Prophet()
+    model.fit(data)
+    return model
+
+def generate_forecast(model, periods=365):
+    future = model.make_future_dataframe(periods=periods)
+    forecast = model.predict(future)
+    return forecast
+
+# Streamlit App Interface
 # Streamlit App Interface
 st.title("Procode Modeling Platform")
 
-uploaded_file = st.file_uploader("Upload Dataset (CSV/Excel)", type=["csv", "xlsx"])
+# Upload Options: Automated or Manual Feature-Engineered Data Upload
+upload_option = st.radio(
+    "Choose Upload Option:",
+    ("Automated Feature Engineering", "Manual Feature Engineered File")
+)
 
-if uploaded_file is not None:
-    try:
-        # Read data
-        if uploaded_file.name.endswith('.csv'):
-            raw_data = pd.read_csv(uploaded_file)
-        else:
-            raw_data = pd.read_excel(uploaded_file)
+if upload_option == "Automated Feature Engineering":
+    uploaded_file = st.file_uploader("Upload Raw Dataset (CSV/Excel)", type=["csv", "xlsx"])
+    if uploaded_file is not None:
+        try:
+            # Read the uploaded file
+            if uploaded_file.name.endswith('.csv'):
+                raw_data = pd.read_csv(uploaded_file)
+            elif uploaded_file.name.endswith('.xlsx'):
+                raw_data = pd.read_excel(uploaded_file)
+            else:
+                st.error("Unsupported file type. Please upload a CSV or Excel file.")
+                st.stop()
 
-        # Show raw data
-        st.subheader("Raw Data Preview")
-        st.dataframe(raw_data.head())
+            st.subheader("Raw Data Preview")
+            st.dataframe(raw_data.head())
 
-        # Validation
-        validation_summary = validate_columns_and_values(raw_data.copy())
-        display_validation_summary(validation_summary)
+            # Column Workflow Selection
+            column_workflow = st.radio(
+                "Choose how you want to modify columns:",
+                ("Delete Unnecessary Columns", "Select Necessary Columns")
+            )
 
-        # Data Cleaning
-        cleaned_data = clean_data(raw_data.copy())
-        st.subheader("Cleaned Data")
-        st.dataframe(cleaned_data.head())
-        
-        # Download cleaned data
-        st.download_button(
-            label="Download Cleaned Data",
-            data=cleaned_data.to_csv(index=False),
-            file_name="cleaned_data.csv",
-            mime="text/csv"
-        )
+            if column_workflow == "Delete Unnecessary Columns":
+                columns_to_delete = st.multiselect(
+                    "Select columns you want to delete:",
+                    options=raw_data.columns.tolist()
+                )
+                if columns_to_delete:
+                    st.write(f"Deleting columns: {columns_to_delete}")
+                    raw_data = raw_data.drop(columns=columns_to_delete)
+            elif column_workflow == "Select Necessary Columns":
+                columns_to_keep = st.multiselect(
+                    "Select columns you want to keep:",
+                    options=raw_data.columns.tolist()
+                )
+                if columns_to_keep:
+                    st.write(f"Keeping only columns: {columns_to_keep}")
+                    raw_data = raw_data[columns_to_keep]
 
-        # Feature Engineering
-        if not cleaned_data.empty:
-            with st.spinner("Creating advanced features..."):
-                feature_data = feature_engineering(cleaned_data.copy())
+            st.write("### Updated Data After Column Modification")
+            st.dataframe(raw_data.head())
+
+            if st.button("Save and Continue"):
+                cleaned_data = clean_data(raw_data.copy())
+                if cleaned_data.empty:
+                    st.error("Cleaned data is empty after processing. Please check your dataset or column selection.")
+                else:
+                    st.subheader("Cleaned Data Preview")
+                    st.dataframe(cleaned_data.head())
+                    feature_data = feature_engineering(cleaned_data.copy())
+                    st.subheader("Feature Engineered Data")
+                    st.dataframe(feature_data.head())
+
+                    sales_data = prepare_dataset(cleaned_data, "order_date", "amount_paid")
+                    model = train_prophet_model(sales_data)
+                    forecast = generate_forecast(model)
+
+                    st.subheader("Sales Forecast")
+                    st.dataframe(forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]])
+                    st.subheader("Forecast Visualization")
+                    fig = model.plot(forecast)
+                    st.pyplot(fig)
+
+        except Exception as e:
+            st.error(f"Processing Error: {e}")
+
+else:
+    manual_file = st.file_uploader("Upload Manually Feature Engineered File", type=["csv", "xlsx"])
+    if manual_file is not None:
+        try:
+            # Read the uploaded file
+            if manual_file.name.endswith('.csv'):
+                manual_data = pd.read_csv(manual_file)
+            elif manual_file.name.endswith('.xlsx'):
+                manual_data = pd.read_excel(manual_file)
+            else:
+                st.error("Unsupported file type. Please upload a CSV or Excel file.")
+                st.stop()
+
+            st.subheader("Manually Feature Engineered Data Preview")
+            st.dataframe(manual_data.head())
+
+            # Validate required columns for Prophet
+            required_columns = ["ds", "y"]
+            missing_columns = [col for col in required_columns if col not in manual_data.columns]
+
+            if missing_columns:
+                st.warning(f"The uploaded file is missing required columns: {', '.join(missing_columns)}.")
                 
-                st.subheader("Feature Engineered Data")
-                st.dataframe(feature_data.head())
-                
-                # Download features
+                # Allow users to dynamically select columns for 'ds' and 'y'
+                st.write("Please select columns for 'ds' (date) and 'y' (value):")
+                ds_column = st.selectbox("Select the column for dates (ds):", manual_data.columns.tolist())
+                y_column = st.selectbox("Select the column for values (y):", manual_data.columns.tolist())
+
+                if ds_column and y_column:
+                    manual_data = manual_data.rename(columns={ds_column: "ds", y_column: "y"})
+                    st.success(f"Columns mapped: 'ds' -> {ds_column}, 'y' -> {y_column}")
+
+            # Convert 'ds' to datetime if not already
+            if not pd.api.types.is_datetime64_any_dtype(manual_data['ds']):
+                manual_data['ds'] = pd.to_datetime(manual_data['ds'], errors='coerce')
+
+            # Check for missing values
+            if manual_data[['ds', 'y']].isnull().any().any():
+                st.error("The dataset contains missing values in 'ds' or 'y' columns. Please clean your data and try again.")
+            else:
+                # Proceed with forecasting
+                sales_data = manual_data[['ds', 'y']]
+                model = train_prophet_model(sales_data)
+                forecast = generate_forecast(model)
+
+                st.subheader("Sales Forecast")
+                st.dataframe(forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]])
+                st.subheader("Forecast Visualization")
+                fig = model.plot(forecast)
+                st.pyplot(fig)
+
+                # Allow downloading forecasted data
                 st.download_button(
-                    label="Download Feature-Engineered Data",
-                    data=feature_data.to_csv(index=False),
-                    file_name="feature_engineered_data.csv",
+                    label="Download Forecasted Data",
+                    data=forecast.to_csv(index=False),
+                    file_name="forecasted_sales.csv",
                     mime="text/csv"
                 )
-                
-                # Model readiness check
-                st.success(f"Data preparation complete! Final shape: {feature_data.shape}")
-                st.write("✅ Suitable for time-series analysis and ML modeling")
-        else:
-            st.error("Cleaning resulted in empty dataset")
 
-    except Exception as e:
-        st.error(f"Processing Error: {str(e)}")
-        st.stop()
+        except Exception as e:
+            st.error(f"Processing Error: {e}")
