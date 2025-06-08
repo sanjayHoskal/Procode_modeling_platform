@@ -1,56 +1,58 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler
 from prophet import Prophet
-import matplotlib.pyplot as plt
 import plotly.express as px
-import plotly.graph_objects as go
-import chardet
-import io
-import kaleido
-from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer, Image
-from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet
-import tempfile
-from prophet import Prophet
+from metrics import mean_absolute_error, root_mean_squared_error, mean_absolute_percentage_error
+from forecasting import (
+    train_prophet_model, train_arima_model, train_sarima_model, train_xgb_model,
+    prepare_dataset, get_train_test_split, auto_detect_columns
+)
 
-from validation import validate_columns_and_values
-from cleaning import clean_data
-from feature_engineering import feature_engineering
-from forecasting import prepare_dataset , train_prophet_model, auto_detect_columns, generate_forecast
-from pdf_gen import generate_pdf_report
-
-
-# ---- Streamlit App ----
+# Streamlit page config
 st.set_page_config(page_title="Forecast Dashboard", layout="wide")
 st.title("📈 Procode Modeling Platform")
-st.sidebar.title("Navigation")
+
+# Sidebar navigation
 section = st.sidebar.radio("Go to", [
     "Upload", "Raw Data", "Cleaned Data", "Feature Engineered Data",
     "Forecast Table", "Forecast Chart", "YoY Growth", "Summary Dashboard",
-    "Download Reports"
+    "Model Explainability", "Advanced Diagnostics", "Download Reports"
 ])
+
+# Sidebar: Model selection and hyperparameters
+st.sidebar.header("Forecast Settings")
+model_choice = st.sidebar.selectbox(
+    "Select Model", ["Auto (Best)", "Prophet", "ARIMA", "SARIMA", "XGBoost"], index=0
+)
+seasonality_mode = st.sidebar.selectbox("Seasonality Mode", ["additive", "multiplicative"], index=0)
+changepoint_prior_scale = st.sidebar.slider("Changepoint Prior Scale", 0.001, 0.5, 0.05)
+arima_p = st.sidebar.number_input("ARIMA p (AR)", min_value=0, max_value=5, value=1)
+arima_d = st.sidebar.number_input("ARIMA d (I)", min_value=0, max_value=2, value=1)
+arima_q = st.sidebar.number_input("ARIMA q (MA)", min_value=0, max_value=5, value=1)
+sarima_p = st.sidebar.number_input("SARIMA p (AR)", min_value=0, max_value=5, value=1)
+sarima_d = st.sidebar.number_input("SARIMA d (I)", min_value=0, max_value=2, value=1)
+sarima_q = st.sidebar.number_input("SARIMA q (MA)", min_value=0, max_value=5, value=1)
+sarima_P = st.sidebar.number_input("SARIMA P (seasonal AR)", min_value=0, max_value=5, value=1)
+sarima_D = st.sidebar.number_input("SARIMA D (seasonal I)", min_value=0, max_value=2, value=1)
+sarima_Q = st.sidebar.number_input("SARIMA Q (seasonal MA)", min_value=0, max_value=5, value=1)
+sarima_s = st.sidebar.number_input("SARIMA s (seasonal period)", min_value=1, max_value=365, value=12)
 
 if 'ran_forecast' not in st.session_state:
     st.session_state["ran_forecast"] = False
 
+# UPLOAD section (with validation and preview)
 if section == "Upload":
     uploaded_file = st.file_uploader("Upload your dataset (CSV or Excel)", type=["csv", "xlsx"])
 
     if uploaded_file:
         if uploaded_file.name.endswith('.csv'):
-            raw_bytes = uploaded_file.read()
-            encoding = chardet.detect(raw_bytes)['encoding']
-            uploaded_file.seek(0)
-            data = pd.read_csv(uploaded_file, encoding=encoding)
+            data = pd.read_csv(uploaded_file)
         else:
             data = pd.read_excel(uploaded_file)
-
         st.session_state["raw_data"] = data.copy()
 
-        # Basic cleaning
+        # Simple cleaning: drop duplicates, basic fillna
         cleaned_data = data.drop_duplicates().copy()
         for col in cleaned_data.select_dtypes(include='object').columns:
             cleaned_data[col] = cleaned_data[col].replace(["Not Available", "NULL", "Missing", "Unknown", " "], np.nan)
@@ -64,7 +66,7 @@ if section == "Upload":
                     cleaned_data[col].fillna("Unknown", inplace=True)
         st.session_state["cleaned_data"] = cleaned_data.copy()
 
-        # Feature engineering
+        # Feature engineering (basic: add year/month/day columns if date present)
         fe_data = cleaned_data.copy()
         date_cols = [col for col in fe_data.columns if pd.api.types.is_datetime64_any_dtype(fe_data[col]) or 'date' in col.lower()]
         for col in date_cols:
@@ -86,42 +88,160 @@ if section == "Upload":
         st.subheader("🛠️ Feature Engineered Data Preview")
         st.dataframe(fe_data.head())
 
-        # Auto detect ds and y columns
+        # Column selection for forecasting
         auto_date_col, auto_target_col = auto_detect_columns(fe_data)
-
-        st.write("### Select Columns for Forecasting")
         date_col = st.selectbox("Select Date Column (ds)", fe_data.columns, index=fe_data.columns.get_loc(auto_date_col))
-        target_col = st.selectbox("Select Target Column (y)", fe_data.select_dtypes(include=np.number).columns, index=list(fe_data.select_dtypes(include=np.number).columns).index(auto_target_col))
+        num_cols = fe_data.select_dtypes(include=np.number).columns
+        target_col = st.selectbox("Select Target Column (y)", num_cols, index=list(num_cols).index(auto_target_col))
 
+        # Store for later use
+        st.session_state['date_col'] = date_col
+        st.session_state['target_col'] = target_col
+        st.session_state['fe_data'] = fe_data
+
+        # FORECAST BUTTON and logic (see next section)
         if st.button("Run Forecast"):
             forecast_data = prepare_dataset(fe_data, date_col, target_col)
-            model = train_prophet_model(forecast_data)
-            forecast = generate_forecast(model)
+            selected_model = model_choice
+            forecast = None
+            model = None
+
+            if selected_model == "Auto (Best)":
+                st.info("Auto-selecting best model using last 30 points as test set...")
+                with st.spinner("Comparing models, please wait..."):
+                    train, test = get_train_test_split(forecast_data, test_size=30)
+                    models_to_try = [
+                        ("Prophet", lambda: train_prophet_model(
+                            train, seasonality_mode=seasonality_mode, changepoint_prior_scale=changepoint_prior_scale,
+                            periods=len(test), return_model=True)),
+                        ("ARIMA", lambda: train_arima_model(
+                            train, order=(arima_p, arima_d, arima_q),
+                            forecast_periods=len(test), return_model=True)),
+                        ("SARIMA", lambda: train_sarima_model(
+                            train, order=(sarima_p, sarima_d, sarima_q),
+                            seasonal_order=(sarima_P, sarima_D, sarima_Q, sarima_s),
+                            forecast_periods=len(test), return_model=True)),
+                        ("XGBoost", lambda: train_xgb_model(
+                            train, forecast_periods=len(test), return_model=True))
+                    ]
+                    best_model_name = None
+                    best_rmse = np.inf
+                    best_model_obj = None
+                    best_forecast = None
+                    model_results = []
+                    for model_name, model_func in models_to_try:
+                        try:
+                            fc, m_obj = model_func()
+                            y_true = test['y'].values
+                            if fc.shape[0] > len(y_true):
+                                y_pred = fc['yhat'].values[-len(y_true):]
+                            else:
+                                y_pred = fc['yhat'].values
+                            rmse = root_mean_squared_error(y_true, y_pred)
+                            model_results.append((model_name, rmse, fc))
+                            if rmse < best_rmse:
+                                best_rmse = rmse
+                                best_model_name = model_name
+                                best_model_obj = m_obj
+                                best_forecast = fc
+                        except Exception as e:
+                            st.warning(f"Model {model_name} failed: {e}")
+
+                    st.subheader("Model RMSE Comparison")
+                    st.table({name: round(rmse, 2) for name, rmse, _ in model_results})
+                    st.success(f"Best model: {best_model_name} (RMSE={best_rmse:.2f}). Running on full dataset...")
+
+                with st.spinner(f"Generating final forecast with {best_model_name}..."):
+                    if best_model_name == "Prophet":
+                        forecast, model = train_prophet_model(
+                            forecast_data,
+                            seasonality_mode=seasonality_mode,
+                            changepoint_prior_scale=changepoint_prior_scale,
+                            periods=365,
+                            return_model=True)
+                    elif best_model_name == "ARIMA":
+                        forecast, model = train_arima_model(
+                            forecast_data,
+                            order=(arima_p, arima_d, arima_q),
+                            forecast_periods=365,
+                            return_model=True)
+                    elif best_model_name == "SARIMA":
+                        forecast, model = train_sarima_model(
+                            forecast_data,
+                            order=(sarima_p, sarima_d, sarima_q),
+                            seasonal_order=(sarima_P, sarima_D, sarima_Q, sarima_s),
+                            forecast_periods=365,
+                            return_model=True)
+                    elif best_model_name == "XGBoost":
+                        forecast, model = train_xgb_model(
+                            forecast_data,
+                            forecast_periods=365,
+                            return_model=True)
+                    selected_model = best_model_name
+
+            else:
+                with st.spinner(f"Running {selected_model} model..."):
+                    if selected_model == "Prophet":
+                        forecast, model = train_prophet_model(
+                            forecast_data,
+                            seasonality_mode=seasonality_mode,
+                            changepoint_prior_scale=changepoint_prior_scale,
+                            periods=365,
+                            return_model=True
+                        )
+                    elif selected_model == "ARIMA":
+                        order = (arima_p, arima_d, arima_q)
+                        forecast, model = train_arima_model(
+                            forecast_data,
+                            order=order,
+                            forecast_periods=365,
+                            return_model=True)
+                    elif selected_model == "SARIMA":
+                        order = (sarima_p, sarima_d, sarima_q)
+                        seasonal_order = (sarima_P, sarima_D, sarima_Q, sarima_s)
+                        forecast, model = train_sarima_model(
+                            forecast_data,
+                            order=order,
+                            seasonal_order=seasonal_order,
+                            forecast_periods=365,
+                            return_model=True)
+                    elif selected_model == "XGBoost":
+                        forecast, model = train_xgb_model(
+                            forecast_data,
+                            forecast_periods=365,
+                            return_model=True)
 
             st.session_state["forecast"] = forecast
-            st.session_state["model"] = model
             st.session_state["ran_forecast"] = True
             st.session_state["date_col"] = date_col
             st.session_state["target_col"] = target_col
+            st.session_state["selected_model"] = selected_model
+            st.session_state["model"] = model
 
-            st.subheader("Forecast Table")
-            st.dataframe(forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]])
+            if forecast is not None:
+                st.subheader(f"Forecast Table ({selected_model})")
+                st.dataframe(forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]])
 
-            st.subheader("Forecast Chart")
-            fig = px.line(forecast, x="ds", y="yhat", title=f"Forecasted Values for {target_col}")
-            fig.add_scatter(x=forecast["ds"], y=forecast["yhat_upper"], mode='lines', name='Upper Bound')
-            fig.add_scatter(x=forecast["ds"], y=forecast["yhat_lower"], mode='lines', name='Lower Bound')
-            st.plotly_chart(fig, use_container_width=True)
+                st.subheader(f"Forecast Chart ({selected_model})")
+                fig = px.line(forecast, x="ds", y="yhat", title=f"Forecasted Values for {target_col} ({selected_model})")
+                fig.add_scatter(x=forecast["ds"], y=forecast["yhat_upper"], mode='lines', name='Upper Bound')
+                fig.add_scatter(x=forecast["ds"], y=forecast["yhat_lower"], mode='lines', name='Lower Bound')
+                st.plotly_chart(fig, use_container_width=True)
 
-            st.subheader("Year-over-Year Growth")
-            forecast["year"] = forecast["ds"].dt.year
-            yearly = forecast.groupby("year")["yhat"].sum().reset_index()
-            yearly["YoY Growth %"] = yearly["yhat"].pct_change() * 100
-            fig2 = px.bar(yearly, x="year", y="YoY Growth %", title=f"YoY Forecast Growth % for {target_col}")
-            st.plotly_chart(fig2, use_container_width=True)
+                st.subheader(f"Year-over-Year Growth ({selected_model})")
+                forecast["year"] = forecast["ds"].dt.year
+                yearly = forecast.groupby("year")["yhat"].sum().reset_index()
+                yearly["YoY Growth %"] = yearly["yhat"].pct_change() * 100
+                fig2 = px.line(yearly, x="year", y="yhat", title="Total Forecast by Year")
+                st.plotly_chart(fig2, use_container_width=True)
 
-            st.markdown("---")
-            st.info("✅ Forecast complete! Please visit the navigation panel for individual graph analysis.")
+                st.markdown("---")
+                st.info(f"✅ Forecast complete using **{selected_model}**! Please visit the navigation panel for individual graph analysis.")
+            else:
+                st.error("Forecasting failed for all models. Please check your data or model settings.")
+
+# Add your sections for Raw Data, Cleaned Data, Feature Engineered Data, etc. (as before).
+# === Data preview sections ===
 
 if section == "Raw Data" and "raw_data" in st.session_state:
     st.subheader("📄 Raw Data")
@@ -133,51 +253,28 @@ if section == "Cleaned Data" and "cleaned_data" in st.session_state:
 
 if section == "Feature Engineered Data" and "fe_data" in st.session_state:
     st.subheader("🛠️ Feature Engineered Data")
-    st.write("Feature engineered data includes additional columns like year, month, day, and day of week extracted from date columns to help improve forecasting accuracy. These features help the model learn seasonal and periodic patterns that occur across time.")
+    st.write("Feature engineered data includes additional columns like year, month, day, and day of week extracted from date columns.")
     st.dataframe(st.session_state["fe_data"].head())
 
-if section in ["Forecast Table", "Forecast Chart", "YoY Growth", "Summary Dashboard", "Download Reports"] and not st.session_state.get("ran_forecast"):
+# === Results sections ===
+
+if section in ["Forecast Table", "Forecast Chart", "YoY Growth", "Summary Dashboard"] and not st.session_state.get("ran_forecast"):
     st.warning("Please upload data and run a forecast first.")
 
 if section == "Forecast Table" and st.session_state.get("ran_forecast"):
     forecast = st.session_state["forecast"]
     st.subheader("📋 Forecast Table")
-    st.write("This table provides numerical forecast results.\n\nEach row contains the predicted value (\"yhat\") for a specific date, along with the lower and upper bounds of the confidence interval (\"yhat_lower\" and \"yhat_upper\"). This helps you understand both the expected values and potential range of fluctuation.")
+    st.write("Numerical forecast results with confidence intervals.")
     st.dataframe(forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]])
 
 if section == "Forecast Chart" and st.session_state.get("ran_forecast"):
     forecast = st.session_state["forecast"]
     st.subheader("📈 Forecast Visualization")
-    st.write("Visualize forecasted values over time with options to show trend lines, confidence intervals, and time-based aggregation.")
-
-    show_trend = st.checkbox("Show Trend Line", True)
-    show_bounds = st.checkbox("Show Confidence Interval", True)
-    aggregate_option = st.selectbox("Aggregate Forecast", ["None", "Monthly", "Weekly", "Quarterly"], index=0)
-
-    fig = go.Figure()
-
-    if aggregate_option != "None":
-        forecast_copy = forecast.copy()
-
-        if aggregate_option == "Monthly":
-            forecast_copy["period"] = forecast_copy["ds"].dt.to_period("M").astype(str)
-        elif aggregate_option == "Weekly":
-            forecast_copy["period"] = forecast_copy["ds"].dt.to_period("W").astype(str)
-        elif aggregate_option == "Quarterly":
-            forecast_copy["period"] = forecast_copy["ds"].dt.to_period("Q").astype(str)
-
-        agg_df = forecast_copy.groupby("period")["yhat"].sum().reset_index()
-        fig.add_trace(go.Scatter(x=agg_df["period"], y=agg_df["yhat"], mode='lines+markers', name=f'{aggregate_option} Forecast'))
-        fig.update_layout(title=f"{aggregate_option} Aggregated Forecast", xaxis_title=aggregate_option, yaxis_title=st.session_state['target_col'])
-
-    else:
-        if show_trend:
-            fig.add_trace(go.Scatter(x=forecast["ds"], y=forecast["yhat"], mode='lines', name='Forecast'))
-        if show_bounds:
-            fig.add_trace(go.Scatter(x=forecast["ds"], y=forecast["yhat_upper"], mode='lines', name='Upper Bound', line=dict(dash='dot')))
-            fig.add_trace(go.Scatter(x=forecast["ds"], y=forecast["yhat_lower"], mode='lines', name='Lower Bound', line=dict(dash='dot')))
-        fig.update_layout(title="Forecast with Trend and Confidence Intervals", xaxis_title="Date", yaxis_title=st.session_state['target_col'])
-
+    model_used = st.session_state.get("selected_model", "Prophet")
+    st.info(f"Model Used: {model_used}")
+    fig = px.line(forecast, x="ds", y="yhat", title=f"Forecasted Values ({model_used})")
+    fig.add_scatter(x=forecast["ds"], y=forecast["yhat_upper"], mode='lines', name='Upper Bound')
+    fig.add_scatter(x=forecast["ds"], y=forecast["yhat_lower"], mode='lines', name='Lower Bound')
     st.plotly_chart(fig, use_container_width=True)
 
 if section == "YoY Growth" and st.session_state.get("ran_forecast"):
@@ -185,28 +282,15 @@ if section == "YoY Growth" and st.session_state.get("ran_forecast"):
     forecast["year"] = forecast["ds"].dt.year
     yearly = forecast.groupby("year")["yhat"].sum().reset_index()
     yearly["YoY Growth %"] = yearly["yhat"].pct_change() * 100
-
     st.subheader("📊 Year-over-Year Growth Analysis")
-    st.write("This section helps you understand how the forecasted values change from one year to the next.\n\nA positive YoY (Year-over-Year) growth percentage suggests increasing performance, while a negative value indicates decline. This can help in strategic planning and goal setting.")
-
-    show_yoy = st.checkbox("Show YoY % Growth Chart", True)
-    show_total = st.checkbox("Show Total Forecast Chart", False)
-
-    col1, col2 = st.columns(2)
-
-    if show_yoy:
-        with col1:
-            fig1 = px.bar(yearly, x="year", y="YoY Growth %", title="Year-over-Year Growth %")
-            st.plotly_chart(fig1, use_container_width=True)
-
-    if show_total:
-        with col2:
-            fig2 = px.line(yearly, x="year", y="yhat", title="Total Forecast by Year")
-            st.plotly_chart(fig2, use_container_width=True)
+    st.dataframe(yearly)
+    fig = px.bar(yearly, x="year", y="YoY Growth %", title="Year-over-Year Growth %")
+    st.plotly_chart(fig, use_container_width=True)
 
 if section == "Summary Dashboard" and st.session_state.get("ran_forecast"):
     st.subheader("📊 Summary Dashboard")
-    st.write("This dashboard summarizes the key outcomes from the forecast.\n\nYou can quickly view the latest forecast value, total forecasted revenue/sales, and the average YoY growth across years to gain high-level insights.")
+    model_used = st.session_state.get("selected_model", "Prophet")
+    st.info(f"Model Used: {model_used}")
     forecast = st.session_state["forecast"]
     latest_forecast = forecast["yhat"].iloc[-1]
     total_forecast = forecast["yhat"].sum()
@@ -220,74 +304,190 @@ if section == "Summary Dashboard" and st.session_state.get("ran_forecast"):
     col2.metric("Total Forecast Value", f"{total_forecast:,.2f}")
     col3.metric("Average YoY Growth", f"{avg_yoy:.2f}%")
 
+# === Model Explainability ===
+
+if section == "Model Explainability" and st.session_state.get("ran_forecast"):
+    st.subheader("🔍 Model Explainability & Insights")
+    model = st.session_state.get("model", None)
+    model_used = st.session_state.get("selected_model", None)
+    forecast = st.session_state.get("forecast", None)
+    if model_used == "Prophet" and model is not None:
+        st.write("**Prophet Trend and Seasonality Components**")
+        st.pyplot(model.plot_components(forecast))
+    elif model_used == "XGBoost" and model is not None:
+        st.write("**XGBoost Feature Importance**")
+        importances = model.feature_importances_
+        feature_names = model.get_booster().feature_names
+        fi_df = pd.DataFrame({"Feature": feature_names, "Importance": importances})
+        fi_df = fi_df.sort_values("Importance", ascending=False)
+        st.bar_chart(fi_df.set_index("Feature"))
+        try:
+            import shap
+            fe_data = st.session_state["fe_data"]
+            date_col = st.session_state["date_col"]
+            target_col = st.session_state["target_col"]
+            df = fe_data.copy()
+            df['year'] = df[date_col].dt.year
+            df['month'] = df[date_col].dt.month
+            df['day'] = df[date_col].dt.day
+            df['dayofweek'] = df[date_col].dt.dayofweek
+            df['y_lag1'] = df[target_col].shift(1)
+            df = df.dropna()
+            X = df[['year', 'month', 'day', 'dayofweek', 'y_lag1']]
+            explainer = shap.Explainer(model)
+            shap_values = explainer(X)
+            st.set_option('deprecation.showPyplotGlobalUse', False)
+            st.write("**XGBoost SHAP Feature Impact:**")
+            st.pyplot(shap.summary_plot(shap_values, X, show=False))
+        except Exception as e:
+            st.info(f"SHAP summary not available: {e}")
+    elif model_used in ["ARIMA", "SARIMA"] and model is not None:
+        st.write("**Residual Diagnostics**")
+        try:
+            import matplotlib.pyplot as plt
+            from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+            fe_data = st.session_state["fe_data"]
+            date_col = st.session_state["date_col"]
+            target_col = st.session_state["target_col"]
+            actual = fe_data.set_index(date_col)[target_col]
+            pred = forecast.set_index("ds")["yhat"]
+            actual = actual.loc[actual.index.intersection(pred.index)]
+            pred = pred.loc[actual.index]
+            residuals = actual - pred
+            fig, ax = plt.subplots(2, 2, figsize=(12, 8))
+            ax[0,0].plot(residuals.index, residuals.values)
+            ax[0,0].set_title("Residuals Over Time")
+            ax[0,1].hist(residuals.dropna(), bins=30)
+            ax[0,1].set_title("Residuals Histogram")
+            plot_acf(residuals.dropna(), ax=ax[1,0], lags=40)
+            ax[1,0].set_title("Residuals Autocorrelation")
+            plot_pacf(residuals.dropna(), ax=ax[1,1], lags=40)
+            ax[1,1].set_title("Residuals Partial Autocorrelation")
+            st.pyplot(fig)
+            st.caption("Ideally, residuals should look random and centered on zero.")
+        except Exception as e:
+            st.info(f"Residual diagnostics not available: {e}")
+    else:
+        st.warning("Model explainability is only available after running a forecast with Prophet, XGBoost, ARIMA, or SARIMA. Please rerun forecast.")
+
+# === Advanced Diagnostics (Prophet Cross-validation, etc.) ===
+
+if section == "Advanced Diagnostics" and st.session_state.get("ran_forecast"):
+    st.subheader("🧪 Advanced Diagnostics & Model Quality")
+    model_used = st.session_state.get("selected_model", "Prophet")
+    model = st.session_state.get("model", None)
+    forecast = st.session_state.get("forecast", None)
+    if model_used == "Prophet" and model is not None:
+        from prophet.diagnostics import cross_validation, performance_metrics
+        try:
+            with st.spinner("Running Prophet cross-validation..."):
+                df_cv = cross_validation(model, initial="365 days", period="180 days", horizon="90 days", parallel="processes")
+                df_p = performance_metrics(df_cv)
+            st.dataframe(df_p[["horizon", "mse", "rmse", "mae", "mape"]])
+            st.line_chart(df_p.set_index("horizon")[["rmse", "mae"]])
+        except Exception as e:
+            st.warning(f"Prophet cross-validation not available: {e}")
+
+# === Compare Model Errors (manual benchmarking) ===
+
+if st.session_state.get("ran_forecast"):
+    st.markdown("---")
+    st.subheader("Compare Model Errors (Last 30 Actual Points)")
+
+    if st.button("Compare All Models"):
+        fe_data = st.session_state.get("fe_data")
+        date_col = st.session_state.get("date_col")
+        target_col = st.session_state.get("target_col")
+        forecast_data = prepare_dataset(fe_data, date_col, target_col)
+        train, test = get_train_test_split(forecast_data, test_size=30)
+        models_to_try = [
+            ("Prophet", lambda: train_prophet_model(
+                train, seasonality_mode=seasonality_mode, changepoint_prior_scale=changepoint_prior_scale,
+                periods=len(test), return_model=True)),
+            ("ARIMA", lambda: train_arima_model(
+                train, order=(arima_p, arima_d, arima_q),
+                forecast_periods=len(test), return_model=True)),
+            ("SARIMA", lambda: train_sarima_model(
+                train, order=(sarima_p, sarima_d, sarima_q),
+                seasonal_order=(sarima_P, sarima_D, sarima_Q, sarima_s),
+                forecast_periods=len(test), return_model=True)),
+            ("XGBoost", lambda: train_xgb_model(
+                train, forecast_periods=len(test), return_model=True))
+        ]
+        results = []
+        for model_name, model_func in models_to_try:
+            try:
+                fc, m_obj = model_func()
+                y_true = test['y'].values
+                if fc.shape[0] > len(y_true):
+                    y_pred = fc['yhat'].values[-len(y_true):]
+                else:
+                    y_pred = fc['yhat'].values
+                mae = mean_absolute_error(y_true, y_pred)
+                rmse = root_mean_squared_error(y_true, y_pred)
+                mape = mean_absolute_percentage_error(y_true, y_pred)
+                results.append((model_name, mae, rmse, mape))
+            except Exception as e:
+                st.warning(f"Model {model_name} failed: {e}")
+        if results:
+            results_df = pd.DataFrame(results, columns=["Model", "MAE", "RMSE", "MAPE"])
+            results_df["MAE"] = results_df["MAE"].round(2)
+            results_df["RMSE"] = results_df["RMSE"].round(2)
+            results_df["MAPE"] = results_df["MAPE"].round(2)
+            st.table(results_df.set_index("Model"))
+
+
 if section == "Download Reports" and st.session_state.get("ran_forecast"):
     st.subheader("📥 Download Reports")
     st.write("""
-    This section allows you to download important results for offline analysis or presentation:
-
-    - **Cleaned Data:** Raw uploaded data after duplicates, missing values, and invalid entries are corrected.
-    - **Feature Engineered Data:** Includes additional features like year, month, day, and day-of-week extracted from date columns.
-    - **Forecast Results:** Final prediction output with date-wise forecasts and confidence bounds.
+    Download cleaned, feature engineered, and forecasted data as CSV.
     """)
 
     # Download Cleaned Data
-    cleaned_csv = st.session_state["cleaned_data"].to_csv(index=False)
-    st.download_button(
-        label="📄 Download Cleaned Data",
-        data=cleaned_csv,
-        file_name="cleaned_data.csv",
-        mime="text/csv"
-    )
+    try:
+        cleaned_csv = st.session_state["cleaned_data"].to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="📄 Download Cleaned Data (CSV)",
+            data=cleaned_csv,
+            file_name="cleaned_data.csv",
+            mime="text/csv"
+        )
+    except Exception as e:
+        st.error(f"Error preparing Cleaned Data CSV: {e}")
 
     # Download Feature Engineered Data
-    fe_csv = st.session_state["fe_data"].to_csv(index=False)
-    st.download_button(
-        label="📄 Download Feature Engineered Data",
-        data=fe_csv,
-        file_name="feature_engineered_data.csv",
-        mime="text/csv"
-    )
+    try:
+        fe_csv = st.session_state["fe_data"].to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="📄 Download Feature Engineered Data (CSV)",
+            data=fe_csv,
+            file_name="feature_engineered_data.csv",
+            mime="text/csv"
+        )
+    except Exception as e:
+        st.error(f"Error preparing Feature Engineered Data CSV: {e}")
 
-        # Download Forecast Results
-    forecast_csv = st.session_state["forecast"].to_csv(index=False)
-    st.download_button(
-        label="📄 Download Forecast Results (CSV)",
-        data=forecast_csv,
-        file_name="forecast_results.csv",
-        mime="text/csv"
-    )
+    # Download Forecasted Results
+    try:
+        forecast = st.session_state["forecast"]
+        slim_forecast = forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]].copy()
+        forecast_csv = slim_forecast.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="📄 Download Forecast Results (CSV)",
+            data=forecast_csv,
+            file_name="forecast_results.csv",
+            mime="text/csv"
+        )
+    except Exception as e:
+        st.error(f"Error preparing Forecast Results CSV: {e}")
 
-    # Generate Metrics for Summary Section
-    forecast = st.session_state["forecast"]
-    metrics = {
-        "total_forecast": forecast["yhat"].sum(),
-        "latest_forecast": forecast["yhat"].iloc[-1],
-        "average_yoy": (forecast.groupby(forecast["ds"].dt.year)["yhat"].sum().pct_change().mean()) * 100
-    }
 
-    # Create Forecast Chart
-    fig_forecast = px.line(forecast, x="ds", y="yhat", title=f"Forecast for {st.session_state['target_col']}")
-    fig_forecast.add_scatter(x=forecast["ds"], y=forecast["yhat_upper"], mode='lines', name='Upper Bound')
-    fig_forecast.add_scatter(x=forecast["ds"], y=forecast["yhat_lower"], mode='lines', name='Lower Bound')
+if section == "Summary Dashboard" and st.session_state.get("ran_forecast"):
+    st.markdown("---")
+    feedback = st.text_area("Any feedback, issues, or suggestions?")
+    if st.button("Submit Feedback"):
+        if feedback.strip():
+            st.success("Thank you for your feedback!")
+        else:
+            st.warning("Please enter some feedback before submitting.")
 
-    # Create YoY Growth Chart
-    forecast["year"] = forecast["ds"].dt.year
-    yearly = forecast.groupby("year")["yhat"].sum().reset_index()
-    yearly["YoY Growth %"] = yearly["yhat"].pct_change() * 100
-    yoy_fig = px.bar(yearly, x="year", y="YoY Growth %", title="Year-over-Year Growth")
-
-    # Generate PDF Report
-    pdf_buffer = generate_pdf_report(
-    forecast=forecast,
-    metrics=metrics,
-    # forecast_image_path=forecast_image_path,
-    # yoy_image_path=yoy_image_path
-)
-
-    # Download PDF Report
-    st.download_button(
-        label="📄 Download Comprehensive PDF Report",
-        data=pdf_buffer,
-        file_name="forecast_report.pdf",
-        mime="application/pdf"
-    )
