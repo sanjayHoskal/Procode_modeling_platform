@@ -8,8 +8,11 @@ from forecasting import (
     train_prophet_model, train_arima_model, train_sarima_model, train_xgb_model,
     prepare_dataset, get_train_test_split, auto_detect_columns
 )
+import streamlit_authenticator as stauth
+import pyrebase
+#from firebase_config import firebaseConfig
 
-# Streamlit page config
+
 st.set_page_config(page_title="Forecast Dashboard", layout="wide")
 st.title("📈 Procode Modeling Platform")
 
@@ -41,10 +44,10 @@ sarima_s = st.sidebar.number_input("SARIMA s (seasonal period)", min_value=1, ma
 if 'ran_forecast' not in st.session_state:
     st.session_state["ran_forecast"] = False
 
-# UPLOAD section (with validation and preview)
+# ------------------- Upload Section & Rest of App -------------------
+
 if section == "Upload":
     uploaded_file = st.file_uploader("Upload your dataset (CSV or Excel)", type=["csv", "xlsx"])
-
     if uploaded_file:
         if uploaded_file.name.endswith('.csv'):
             data = pd.read_csv(uploaded_file)
@@ -94,12 +97,10 @@ if section == "Upload":
         num_cols = fe_data.select_dtypes(include=np.number).columns
         target_col = st.selectbox("Select Target Column (y)", num_cols, index=list(num_cols).index(auto_target_col))
 
-        # Store for later use
         st.session_state['date_col'] = date_col
         st.session_state['target_col'] = target_col
         st.session_state['fe_data'] = fe_data
 
-        # FORECAST BUTTON and logic (see next section)
         if st.button("Run Forecast"):
             forecast_data = prepare_dataset(fe_data, date_col, target_col)
             selected_model = model_choice
@@ -239,6 +240,7 @@ if section == "Upload":
                 st.info(f"✅ Forecast complete using **{selected_model}**! Please visit the navigation panel for individual graph analysis.")
             else:
                 st.error("Forecasting failed for all models. Please check your data or model settings.")
+
 
 # Add your sections for Raw Data, Cleaned Data, Feature Engineered Data, etc. (as before).
 # === Data preview sections ===
