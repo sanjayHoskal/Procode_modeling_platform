@@ -38,8 +38,36 @@ from forecasting import (
     train_prophet_model, train_arima_model, train_sarima_model, train_xgb_model,
     prepare_dataset, get_train_test_split, auto_detect_columns
 )
+from auth import login_form
+from firebase_auth import google_login, email_password_login
 
-# Streamlit page config
+
+def main():
+    st.title("📊 ProCode Sales Prediction Platform")
+
+    if "user" not in st.session_state:
+        st.session_state["user"] = None
+
+    if not st.session_state["user"]:
+        st.info("Please sign in to continue")
+        tab1, tab2 = st.tabs(["Username/Password", "Google Login"])
+        with tab1:
+            login_form()
+        with tab2:
+            google_login()
+        return  # stop here until logged in
+
+    # 🚀 If logged in → show your existing workflow
+    st.success(f"Welcome {st.session_state['user']}!")
+    st.write("Now you can access the full workflow here...")
+
+
+    if st.button("Logout"):
+        st.session_state["user"] = None
+        st.rerun()
+
+
+
 st.set_page_config(page_title="Forecast Dashboard", layout="wide")
 st.title("📈 Procode Modeling Platform")
 
@@ -71,10 +99,10 @@ sarima_s = st.sidebar.number_input("SARIMA s (seasonal period)", min_value=1, ma
 if 'ran_forecast' not in st.session_state:
     st.session_state["ran_forecast"] = False
 
-# UPLOAD section (with validation and preview)
+# ------------------- Upload Section & Rest of App -------------------
+
 if section == "Upload":
     uploaded_file = st.file_uploader("Upload your dataset (CSV or Excel)", type=["csv", "xlsx"])
-
     if uploaded_file:
         if uploaded_file.name.endswith('.csv'):
             data = pd.read_csv(uploaded_file)
@@ -124,12 +152,10 @@ if section == "Upload":
         num_cols = fe_data.select_dtypes(include=np.number).columns
         target_col = st.selectbox("Select Target Column (y)", num_cols, index=list(num_cols).index(auto_target_col))
 
-        # Store for later use
         st.session_state['date_col'] = date_col
         st.session_state['target_col'] = target_col
         st.session_state['fe_data'] = fe_data
 
-        # FORECAST BUTTON and logic (see next section)
         if st.button("Run Forecast"):
             forecast_data = prepare_dataset(fe_data, date_col, target_col)
             selected_model = model_choice
@@ -269,6 +295,7 @@ if section == "Upload":
                 st.info(f"✅ Forecast complete using **{selected_model}**! Please visit the navigation panel for individual graph analysis.")
             else:
                 st.error("Forecasting failed for all models. Please check your data or model settings.")
+
 
 # Add your sections for Raw Data, Cleaned Data, Feature Engineered Data, etc. (as before).
 # === Data preview sections ===
@@ -522,6 +549,10 @@ if section == "Summary Dashboard" and st.session_state.get("ran_forecast"):
             st.warning("Please enter some feedback before submitting.")
 
 
+if __name__ == "__main__":
+    main()
+
+
 
 
 
@@ -600,6 +631,7 @@ def feature_engineering(data):
             st.warning(f"Date processing warning in column '{date_col}': {e}")
 
     return data
+
 
 
 
@@ -737,6 +769,7 @@ def auto_detect_columns(df):
 
 
 
+
 #pdf_gen
 
 import io
@@ -793,5 +826,298 @@ def generate_pdf_report(forecast, metrics, forecast_image_path, yoy_image_path, 
     pdf.build(elements)
     buffer.seek(0)
     return buffer
+
+
+
+
+
+
+
+# validation.py
+
+import numpy as np
+import pandas as pd
+
+# Validation Framework
+def validate_columns_and_values(data):
+    validation_results = {}
+    data.columns = [col.strip().lower().replace(" ", "_") for col in data.columns]
+
+    for column in data.columns:
+        validation_results[column] = {
+            "missing_count": 0,
+            "missing_values": [],
+            "invalid_count": 0,
+            "invalid_values": [],
+            "outlier_count": 0,
+            "outlier_values": []
+        }
+
+        if data[column].dtype in ['float64', 'int64']:
+            missing = data[data[column].isnull()]
+            validation_results[column]["missing_count"] = missing.shape[0]
+            validation_results[column]["missing_values"] = list(missing[column].unique())
+            invalid = data[data[column] < 0]
+            validation_results[column]["invalid_count"] = invalid.shape[0]
+            validation_results[column]["invalid_values"] = list(invalid[column].unique())
+            data[column] = data[column].apply(lambda x: max(x, 0))
+            z_scores = (data[column] - data[column].mean()) / data[column].std()
+            outliers = data[np.abs(z_scores) > 3]
+            validation_results[column]["outlier_count"] = outliers.shape[0]
+            validation_results[column]["outlier_values"] = list(outliers[column].unique())
+
+        elif data[column].dtype == 'object':
+            missing = data[data[column].isnull() | (data[column] == "")]
+            validation_results[column]["missing_count"] = missing.shape[0]
+            validation_results[column]["missing_values"] = list(missing[column].unique())
+            invalid = data[data[column].str.contains(r"NULL|Not Available|Missing", na=False)]
+            validation_results[column]["invalid_count"] = invalid.shape[0]
+            validation_results[column]["invalid_values"] = list(invalid[column].unique())
+
+        elif pd.api.types.is_datetime64_any_dtype(data[column]):
+            missing = data[data[column].isnull()]
+            validation_results[column]["missing_count"] = missing.shape[0]
+            validation_results[column]["missing_values"] = list(missing[column].unique())
+            invalid = data[data[column] > pd.Timestamp.now()]
+            validation_results[column]["invalid_count"] = invalid.shape[0]
+            validation_results[column]["invalid_values"] = list(invalid[column].unique())
+
+    return validation_results
+
+
+
+
+
+
+
+
+
+    #requirements.text
+
+    absl-py==2.2.2
+aiohappyeyeballs==2.6.1
+aiohttp==3.11.18
+aiosignal==1.3.2
+altair==5.5.0
+attrs==25.3.0
+beautifulsoup4==4.13.4
+blinker==1.9.0
+CacheControl==0.14.2
+cachetools==5.5.2
+certifi==2025.4.26
+cffi==1.17.1
+chardet==5.2.0
+charset-normalizer==3.4.1
+click==8.1.8
+cmdstanpy==1.2.5
+colorama==0.4.6
+contourpy==1.3.2
+cryptography==44.0.2
+cycler==0.12.1
+et_xmlfile==2.0.0
+filelock==3.18.0
+firebase-admin==6.8.0
+fonttools==4.57.0
+frozenlist==1.6.0
+fsspec==2025.3.2
+gitdb==4.0.12
+GitPython==3.1.44
+google==3.0.0
+google-api-core==2.25.0rc0
+google-api-python-client==2.168.0
+google-auth==2.39.0
+google-auth-httplib2==0.2.0
+google-cloud-core==2.4.3
+google-cloud-firestore==2.20.2
+google-cloud-storage==3.1.0
+google-crc32c==1.7.1
+google-resumable-media==2.7.2
+googleapis-common-protos==1.70.0
+grpcio==1.71.0
+grpcio-status==1.71.0
+holidays==0.71
+httplib2==0.22.0
+idna==3.10
+importlib_resources==6.5.2
+Jinja2==3.1.6
+joblib==1.4.2
+jsonschema==4.23.0
+jsonschema-specifications==2025.4.1
+kaleido==0.2.1
+kiwisolver==1.4.8
+lightning-utilities==0.14.3
+Markdown==3.8
+MarkupSafe==3.0.2
+matplotlib==3.10.1
+msgpack==1.1.0
+multidict==6.4.3
+narwhals==1.36.0
+networkx==3.4.2
+numpy==2.2.5
+openpyxl==3.1.5
+packaging==24.2
+pandas==2.2.3
+pillow==11.2.1
+platformdirs==4.3.7
+plotly==5.24.1
+propcache==0.3.1
+prophet==1.1.6
+proto-plus==1.26.1
+protobuf==5.29.4
+pyarrow==19.0.1
+pyasn1==0.6.1
+pyasn1_modules==0.4.2
+pycparser==2.22
+pycryptodome==3.22.0
+pydeck==0.9.1
+PyJWT==2.10.1
+pyparsing==3.2.3
+Pyrebase4==4.8.0
+python-dateutil==2.9.0.post0
+python-jwt==2.0.1
+pytorch-lightning==1.9.5
+PyYAML==6.0.2
+referencing==0.36.2
+reportlab==4.4.0
+requests==2.32.3
+requests-toolbelt==0.9.1
+rpds-py==0.24.0
+rsa==4.9
+scikit-learn==1.6.1
+scipy==1.15.2
+seaborn==0.13.2
+setuptools==78.1.0
+six==1.17.0
+smmap==5.0.2
+soupsieve==2.7
+stanio==0.5.1
+streamlit==1.44.1
+sympy==1.13.1
+tenacity==9.1.2
+tensorboard==2.19.0
+tensorboard-data-server==0.7.2
+threadpoolctl==3.6.0
+toml==0.10.2
+torch==2.6.0
+torchaudio==2.6.0
+torchmetrics==1.7.0
+torchvision==0.21.0
+tornado==6.4.2
+tqdm==4.67.1
+traitlets==5.14.3
+typing_extensions==4.13.2
+tzdata==2025.2
+uritemplate==4.1.1
+urllib3==1.26.20
+watchdog==6.0.0
+Werkzeug==3.1.3
+wheel==0.45.1
+yarl==1.19.0
+
+
+
+
+
+
+# metrics.py
+
+# metrics.py
+import numpy as np
+
+def mean_absolute_error(y_true, y_pred):
+    return np.mean(np.abs(y_true - y_pred))
+
+def mean_squared_error(y_true, y_pred):
+    return np.mean((y_true - y_pred)**2)
+
+def root_mean_squared_error(y_true, y_pred):
+    return np.sqrt(mean_squared_error(y_true, y_pred))
+
+def mean_absolute_percentage_error(y_true, y_pred):
+    # Avoid division by zero
+    y_true = np.where(y_true == 0, 1e-8, y_true)
+    return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+
+
+
+
+
+#auth.py
+
+# auth.py
+import streamlit as st
+
+# Dummy user store (replace with Firebase later)
+USERS = {
+    "admin": {"password": "procodeadmin@123", "name": "Admin"},
+}
+
+def login_form():
+    st.subheader("🔐 Login with Username & Password")
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+    if st.button("Login"):
+        if username in USERS and USERS[username]["password"] == password:
+            st.session_state["user"] = USERS[username]["name"]
+            st.success(f"Welcome {USERS[username]['name']} 🎉")
+            return True
+        else:
+            st.error("Invalid username or password")
+            return False
+    return False
+
+
+
+
+
+
+#firebase_auth.py
+
+
+# firebase_auth.py
+import streamlit as st
+import pyrebase
+
+firebaseConfig = {
+    "apiKey": "YAIzaSyAO0O5rV6qBAH2rvKMcrJyEPofa5kRZKzoOUR_API_KEY",
+    "authDomain": "procode-modeling-platform.firebaseapp.com",
+    "projectId": "procode-modeling-platform",
+    "storageBucket": "procode-modeling-platform.firebasestorage.app",
+    "messagingSenderId": "557435622129",
+    "appId": "1:557435622129:web:a2971130b34f3189ea0f50",
+    "measurementId": "G-BEMNMY4JL6",
+    # "databaseURL": ""
+}
+
+firebase = pyrebase.initialize_app(firebaseConfig)
+auth = firebase.auth()
+
+def email_password_login():
+    st.subheader("📧 Login with Email & Password")
+    email = st.text_input("Email")
+    password = st.text_input("Password", type="password")
+    if st.button("Login with Email"):
+        try:
+            user = auth.sign_in_with_email_and_password(email, password)
+            st.session_state["user"] = email
+            st.success(f"✅ Logged in as {email}")
+            return True
+        except Exception as e:
+            st.error("❌ Invalid email or password")
+            return False
+    return False
+
+
+def google_login():
+    st.subheader("🔑 Login with Google")
+    st.markdown(
+        "[Click here to sign in with Google](https://accounts.google.com/o/oauth2/v2/auth)"
+    )
+    st.info("👉 For now, you can test Google login directly via Firebase console. "
+            "Advanced integration with OAuth flow can be added later.")
+
+
+
+
 
 

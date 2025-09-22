@@ -8,72 +8,45 @@ from forecasting import (
     train_prophet_model, train_arima_model, train_sarima_model, train_xgb_model,
     prepare_dataset, get_train_test_split, auto_detect_columns
 )
-from streamlit_js_eval import get_geolocation, get_user_agent
-import pyrebase
-from firebase_config import firebaseConfig
-import pyrebase
-from firebase_config import firebaseConfig
-# import streamlit_authenticator as stauth
+from auth import login_form
+from firebase_auth import google_login, email_password_login
 
 
-# Streamlit page config
-st.set_page_config(page_title="Forecast Dashboard", layout="wide")
-st.title("📈 Procode Modeling Platform")
+def main():
+    st.title("📊 ProCode Sales Prediction Platform")
+
+    if "user" not in st.session_state:
+        st.session_state["user"] = None
+
+    if not st.session_state["user"]:
+        st.info("Please sign in to continue")
+        tab1, tab2 = st.tabs(["Username/Password", "Google Login"])
+        with tab1:
+            login_form()
+        with tab2:
+            google_login()
+        return  # stop here until logged in
+
+    # 🚀 If logged in → show your existing workflow
+    st.success(f"Welcome {st.session_state['user']}!")
+    st.write("Now you can access the full workflow here...")
 
 
-
-# Show Google Login Button (via HTML/JS)
-st.markdown("""
-    <a href="https://accounts.google.com/o/oauth2/v2/auth?client_id=362922193503-2ntef49on3v7dree8tss63ekhqi3cjt1.apps.googleusercontent.com
-    &redirect_uri=http://localhost:8501
-    &response_type=token
-    &scope=email profile openid">
-    <button style="font-size:18px;padding:10px;">Sign in with Google</button></a>
-""", unsafe_allow_html=True)
-
-# After user logs in, handle the returned access token
-params = st.query_params
-access_token = params.get("access_token", [None])[0]
-if access_token:
-    st.success("You are logged in with Google!")
-    # Now use access_token to get user info or link with Firebase
-else:
-    st.warning("Please sign in to use the app.")
-
-
-#streamlit-authentication
-# names = ['John Doe']
-# usernames = ['johndoe']
-# passwords = ['12345']
-
-# hashed_passwords = stauth.Hasher(passwords).generate()
-
-# authenticator = stauth.Authenticate(names, usernames, hashed_passwords, 'cookie_name', 'key', cookie_expiry_days=1)
-
-# name, authentication_status, username = authenticator.login('Login', 'main')
-# if authentication_status:
-#     st.success(f"Welcome {name}!")
+    if st.button("Logout"):
+        st.session_state["user"] = None
+        st.rerun()
 
 
 
-
-firebase = pyrebase.initialize_app(firebaseConfig)
-db = firebase.database()
-
-# Example: Save forecast result for user
-def save_user_forecast(user_email, forecast_df):
-    db.child("user_forecasts").child(user_email.replace('.', '_')).push(forecast_df.to_dict('records'))
-
-
-
-
+    st.set_page_config(page_title="Forecast Dashboard", layout="wide")
+    st.title("📈 Procode Modeling Platform")
 
 # Sidebar navigation
-section = st.sidebar.radio("Go to", [
-    "Upload", "Raw Data", "Cleaned Data", "Feature Engineered Data",
-    "Forecast Table", "Forecast Chart", "YoY Growth", "Summary Dashboard",
-    "Model Explainability", "Advanced Diagnostics", "Download Reports"
-])
+    section = st.sidebar.radio("Go to", [
+        "Upload", "Raw Data", "Cleaned Data", "Feature Engineered Data",
+        "Forecast Table", "Forecast Chart", "YoY Growth", "Summary Dashboard",
+        "Model Explainability", "Advanced Diagnostics", "Download Reports"
+]       )
 
 # Sidebar: Model selection and hyperparameters
 st.sidebar.header("Forecast Settings")
@@ -96,10 +69,10 @@ sarima_s = st.sidebar.number_input("SARIMA s (seasonal period)", min_value=1, ma
 if 'ran_forecast' not in st.session_state:
     st.session_state["ran_forecast"] = False
 
-# UPLOAD section (with validation and preview)
+# ------------------- Upload Section & Rest of App -------------------
+
 if section == "Upload":
     uploaded_file = st.file_uploader("Upload your dataset (CSV or Excel)", type=["csv", "xlsx"])
-
     if uploaded_file:
         if uploaded_file.name.endswith('.csv'):
             data = pd.read_csv(uploaded_file)
@@ -149,12 +122,10 @@ if section == "Upload":
         num_cols = fe_data.select_dtypes(include=np.number).columns
         target_col = st.selectbox("Select Target Column (y)", num_cols, index=list(num_cols).index(auto_target_col))
 
-        # Store for later use
         st.session_state['date_col'] = date_col
         st.session_state['target_col'] = target_col
         st.session_state['fe_data'] = fe_data
 
-        # FORECAST BUTTON and logic (see next section)
         if st.button("Run Forecast"):
             forecast_data = prepare_dataset(fe_data, date_col, target_col)
             selected_model = model_choice
@@ -294,6 +265,7 @@ if section == "Upload":
                 st.info(f"✅ Forecast complete using **{selected_model}**! Please visit the navigation panel for individual graph analysis.")
             else:
                 st.error("Forecasting failed for all models. Please check your data or model settings.")
+
 
 # Add your sections for Raw Data, Cleaned Data, Feature Engineered Data, etc. (as before).
 # === Data preview sections ===
@@ -546,3 +518,8 @@ if section == "Summary Dashboard" and st.session_state.get("ran_forecast"):
         else:
             st.warning("Please enter some feedback before submitting.")
 
+
+
+
+if __name__ == "__main__":
+    main()
